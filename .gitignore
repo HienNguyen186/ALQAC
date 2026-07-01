@@ -12,9 +12,7 @@ build/
 venv/
 env/
 
-# Data (không push data thô lên GitHub)
-data/raw/
-data/processed/
+# Data (đã xác nhận cho phép push)
 
 # Outputs / submissions (chỉ push submission đã được chọn)
 outputs/submissions/
