@@ -38,3 +38,6 @@ notebooks/.ipynb_checkpoints/
 # OS
 .DS_Store
 Thumbs.db
+
+# Contest info (không public)
+ALQAC2026_context.md
