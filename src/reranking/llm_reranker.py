@@ -1,27 +1,27 @@
 """
 Module : src/reranking/llm_reranker.py
 Engine : LLM Relevance Filter (SLM #1)  .  Stage 3/4 trong pipeline
-Model  : Qwen/Qwen2.5-3B-Instruct  (~2GB VRAM voi 4-bit)
-Dung boi: scripts/run_pipeline.py
+Model  : Qwen/Qwen2.5-3B-Instruct  (~2GB VRAM với 4-bit)
+Dùng bởi: scripts/run_pipeline.py
 
-NHIEM VU
-  Voi MOI article trong top-20 (tu BGE-M3), hoi SLM:
-    "Dieu luat nay co truc tiep lien quan den vu an khong?"
-  Chi giu lai cac article duoc tra loi "co".
+NHIỆM VỤ
+  Với MỖI article trong top-20 (từ BGE-M3), hỏi SLM:
+    "Điều luật này có trực tiếp liên quan đến vụ án không?"
+  Chỉ giữ lại các article được trả lời "có".
 
 INPUT
   LLMReranker(mode, model_name)
-    mode       - "mock" (test) | "local" (Qwen2.5-3B that)
+    mode       - "mock" (test) | "local" (Qwen2.5-3B thật)
     model_name - "Qwen/Qwen2.5-3B-Instruct"
 
   .rerank(query, articles, min_keep=2, max_keep=5)
-    query     - noi dung vu an
-    articles  - top-20 tu DenseRetriever: [{"law_id","aid","content","dense_score","rank"},...]
-    min_keep  - giu toi thieu N articles (fallback)
-    max_keep  - giu toi da N articles -> vao Qwen3-8B
+    query     - nội dung vụ án
+    articles  - top-20 từ DenseRetriever: [{"law_id","aid","content","dense_score","rank"},...]
+    min_keep  - giữ tối thiểu N articles (fallback)
+    max_keep  - giữ tối đa N articles → vào Qwen3-8B
 
 OUTPUT
-  list[dict] - 2~5 articles, them field "llm_relevant": True
+  list[dict] - 2~5 articles, thêm field "llm_relevant": True
   [
     {"law_id": "91/2015/QH13", "aid": 53354, "content": "...",
      "dense_score": 0.872, "rank": 1, "llm_relevant": True},
@@ -29,35 +29,38 @@ OUTPUT
   ]
 
 FALLBACK
-  Neu < min_keep articles duoc gan "co" -> lay top min_keep theo dense_score.
+  Nếu < min_keep articles được gán "có" → lấy top min_keep theo dense_score.
 """
 
 import re
 
 RELEVANCE_PROMPT = """\
-Ban la chuyen gia phap ly Viet Nam. Nhiem vu: danh gia xem dieu luat co lien quan \
-truc tiep den vu an khong.
+Bạn là chuyên gia pháp lý Việt Nam. Nhiệm vụ: đánh giá xem điều luật có liên quan \
+trực tiếp đến vụ án không.
 
-VU AN:
+VỤ ÁN:
 {query}
 
-DIEU LUAT ({law_id}):
+ĐIỀU LUẬT ({law_id}):
 {article}
 
-Cau hoi: Dieu luat tren co truc tiep dieu chinh hoac lam can cu phap ly \
-de giai quyet vu an khong?
+Câu hỏi: Điều luật trên có trực tiếp điều chỉnh hoặc làm căn cứ pháp lý \
+để giải quyết vụ án không?
 
-Tra loi CHI mot tu: co / khong"""
+Trả lời CHỈ một từ: có / không"""
 
 
 def _parse_yes_no(text: str) -> bool:
     head = text.strip().lower()[:30]
-    if head.startswith("khong"):
+    if head.startswith("không") or head.startswith("khong"):
         return False
-    if re.search(r"^co", head):
+    if re.search(r"^có|^co\b", head):
         return True
-    idx_co    = text.lower().find("co")
-    idx_khong = text.lower().find("khong")
+    t = text.lower()
+    positions_co    = [t.find("có"), t.find("co")]
+    positions_khong = [t.find("không"), t.find("khong")]
+    idx_co    = min((i for i in positions_co    if i >= 0), default=-1)
+    idx_khong = min((i for i in positions_khong if i >= 0), default=-1)
     if idx_co >= 0 and (idx_khong < 0 or idx_co < idx_khong):
         return True
     return False
