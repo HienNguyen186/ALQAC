@@ -1,0 +1,23 @@
+# ── Retrieval ──────────────────────────────────────────────────────────────────
+rank-bm25>=0.2.2
+sentence-transformers>=3.0.1      # BGE-M3 bi-encoder
+
+# ── LLM inference (GPU) ────────────────────────────────────────────────────────
+torch>=2.3.0                      # PyTorch — cài riêng nếu cần CUDA cụ thể (xem bên dưới)
+transformers>=4.44.0              # Qwen2.5-3B + Qwen3-8B
+accelerate>=0.33.0                # device_map="auto"
+bitsandbytes>=0.43.0              # 4-bit quantization (giảm VRAM ~4x)
+
+# ── API & utils ────────────────────────────────────────────────────────────────
+requests>=2.32.0
+python-dotenv>=1.0.1
+tqdm>=4.66.0
+pyyaml>=6.0.2
+
+# ── Evaluation ─────────────────────────────────────────────────────────────────
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.5.0
+
+# ── Notebook (optional) ────────────────────────────────────────────────────────
+jupyter>=1.0.0

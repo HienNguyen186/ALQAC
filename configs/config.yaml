@@ -1,0 +1,27 @@
+api:
+  base_url: "https://alqac2026-leaderboard.ngrok.app"
+  rate_limit_sec: 5          # 1 request / 5 giây
+  max_api_calls_per_case: 5  # tối đa để tránh penalty
+
+data:
+  law_corpus: "data/raw/corpus_law_pub.json"
+  public_test: "data/raw/ALQAC2026_public_test.json"
+
+retrieval:
+  bm25_top_k_laws: 3         # số văn bản luật lấy từ BM25 vòng 1
+  bm25_top_k_articles: 20    # số articles lấy từ BM25 vòng 2
+  rerank_top_k: 5            # số articles sau cross-encoder rerank
+  dense_model: "BAAI/bge-m3" # embedding model
+
+prediction:
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  max_new_tokens: 256
+  temperature: 0.1
+  labels:
+    - "A_WIN"
+    - "B_WIN"
+    - "PARTIAL_A_WIN"
+    - "PARTIAL_B_WIN"
+
+output:
+  submissions_dir: "outputs/submissions"
