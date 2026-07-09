@@ -60,13 +60,14 @@ class DenseRetriever:
 
     def __init__(
         self,
-        mode: str = "mock",
+        mode: str = "local",
         model_name: str = "BAAI/bge-m3",
         batch_size: int = 32,
         weight_dense: float = 0.6,
         weight_sparse: float = 0.4,
         use_colbert: bool = False,
         cache_dir: str | Path | None = None,
+        model_cache_dir: str | Path | None = None,
         device: str | None = None,
     ):
         self.mode = mode
@@ -79,6 +80,15 @@ class DenseRetriever:
             Path(cache_dir) if cache_dir
             else find_project_root() / "outputs" / "cache" / "embeddings"
         )
+        # Tự tìm thư mục models/ trong project tree
+        if model_cache_dir:
+            self.model_cache_dir = Path(model_cache_dir)
+        else:
+            _here = Path(__file__).resolve()
+            self.model_cache_dir = next(
+                (p / "models" for p in _here.parents if (p / "models").is_dir()),
+                None,
+            )
         self.device = device
         self._model = None
 
@@ -86,18 +96,6 @@ class DenseRetriever:
             self._load_model()
 
     def _load_model(self) -> None:
-        """
-        Load BGE-M3 completely offline from local HuggingFace cache.
-        """
-
-        from src.utils.model_cache import (
-            configure_hf_cache,
-            get_model_path,
-        )
-
-        # Configure HF cache before importing FlagEmbedding
-        configure_hf_cache()
-
         try:
             from FlagEmbedding import BGEM3FlagModel
         except ImportError as exc:
@@ -110,35 +108,23 @@ class DenseRetriever:
         try:
             import torch
             use_fp16 = torch.cuda.is_available()
-            chosen_device = self.device or (
-                "cuda" if torch.cuda.is_available() else "cpu"
-            )
+            chosen_device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
         except ImportError:
             use_fp16 = False
             chosen_device = "cpu"
 
-        model_path = get_model_path(self.model_name)
-
-        LOGGER.info(
-            "[DenseRetriever] Loading local model:\n%s",
-            model_path,
-        )
-
-        LOGGER.info(
-            "[DenseRetriever] Device=%s fp16=%s",
-            chosen_device,
-            use_fp16,
-        )
-
+        cache = str(self.model_cache_dir) if self.model_cache_dir else None
+        LOGGER.info("[DenseRetriever] Loading %s on %s (fp16=%s, cache=%s) ...",
+                    self.model_name, chosen_device, use_fp16, cache)
         self._model = BGEM3FlagModel(
-            model_path,
+            self.model_name,
             use_fp16=use_fp16,
             devices=[chosen_device],
             return_dense=True,
             return_sparse=True,
             return_colbert_vecs=self.use_colbert,
+            cache_dir=cache,
         )
-
         LOGGER.info("[DenseRetriever] Ready")
 
     @staticmethod

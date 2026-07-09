@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-_cache_dir = PROJECT_ROOT / "models" / "hub"
+_cache_dir = PROJECT_ROOT / "models"
 if _cache_dir.exists():
     os.environ.setdefault("HF_HOME", str(_cache_dir))
     os.environ.setdefault("TRANSFORMERS_CACHE", str(_cache_dir))
@@ -126,8 +126,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     rc = config.get("retrieval", {})
     pc = config.get("prediction", {})
     parser = argparse.ArgumentParser(description="Run the ALQAC 2026 Legal AI pipeline.")
-    parser.add_argument("--rerank-mode", default="mock", choices=["mock", "local"])
-    parser.add_argument("--llm-mode",    default="mock", choices=["mock", "local"])
+    parser.add_argument("--rerank-mode", default="local", choices=["mock", "local"])
+    parser.add_argument("--llm-mode",    default="local", choices=["mock", "local"])
     parser.add_argument("--dense-model", default=rc.get("dense_model", "BAAI/bge-m3"))
     parser.add_argument("--llm1-model",  default=pc.get("reranker_model", "Qwen/Qwen2.5-3B-Instruct"))
     parser.add_argument("--llm2-model",  default=pc.get("predictor_model", "Qwen/Qwen3-8B"))
