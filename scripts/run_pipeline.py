@@ -24,7 +24,6 @@ if _cache_dir.exists():
 
 from tqdm import tqdm
 
-from src.api.case_api import CaseAPIClient
 from src.prediction.llm_predictor import LLMPredictor
 from src.reranking.dense_reranker import DenseRetriever
 from src.reranking.llm_reranker import LLMReranker
@@ -34,33 +33,6 @@ from src.utils.io import FriendlyFileError, load_json_file, resolve_path, setup_
 
 LOGGER = logging.getLogger(__name__)
 
-def get_case_context(case: dict[str, Any], case_api: CaseAPIClient) -> tuple[str, list[dict]]:
-    """
-    Public:
-        dùng case_fact nếu có.
-
-    Private:
-        lấy qua Case API.
-    """
-
-    # Public test
-    if case.get("case_fact"):
-        return case["case_fact"], []
-
-    # Private test
-    chunks = case_api.retrieve_multi(
-        case_id=str(case["case_id"]),
-        case_query=str(case["case_query"]),
-    )
-
-    if not chunks:
-        return str(case["case_query"]), []
-
-    case_context = "\n\n".join(
-        chunk["text"] for chunk in chunks
-    )
-
-    return case_context, chunks
 
 def run_pipeline(
     test_path: str | Path,
@@ -105,83 +77,39 @@ def run_pipeline(
     LOGGER.info("[4/4] Loading predictor mode=%s", llm_mode)
     predictor = LLMPredictor(mode=llm_mode, model_name=llm2_model)
 
-    LOGGER.info("[5/5] Initializing Case API")
-    case_api = CaseAPIClient(
-        mode="real",
-    )
-
-    LOGGER.info("Downloading private cases...")
-
-    cases = case_api.get_private_cases()
-
-    LOGGER.info("Received %d cases", len(cases))
-
+    cases = validate_case_records(load_json_file(resolve_path(test_path, PROJECT_ROOT), "ALQAC public/private test set"))
     if limit is not None:
         cases = cases[:max(0, limit)]
     LOGGER.info("Loaded %s cases", len(cases))
 
     submissions: list[dict[str, Any]] = []
     for case in tqdm(cases, desc="Pipeline"):
-
-        case_id = str(case["case_id"])
+        case_id    = str(case["case_id"])
         case_query = str(case["case_query"])
 
-        case_context, chunks = get_case_context(
-            case,
-            case_api,
-        )
-
-        # ==========================================
-        # BM25
-        # ==========================================
         candidate_pool = retriever.retrieve_candidate_pool(
-            case_context,
+            case_query,
             top_k_articles=top_k_bm25_articles,
             top_k_laws=top_k_laws,
             strategy=candidate_strategy,
         )
-
-        # ==========================================
-        # Dense Retrieval
-        # ==========================================
-        top_articles = dense.retrieve(
-            case_context,
-            candidate_pool,
-            top_k=top_k_dense,
-        )
-
-        # ==========================================
-        # LLM Reranker
-        # ==========================================
-        final_articles = llm_reranker.rerank(
-            case_context,
-            top_articles,
-            min_keep=final_min_k,
-            max_keep=final_max_k,
-        )
-
-        # ==========================================
-        # Predictor
-        # ==========================================
-        result = predictor.predict(
-            case_context,
-            final_articles,
-        )
+        top_articles   = dense.retrieve(case_query, candidate_pool, top_k=top_k_dense)
+        final_articles = llm_reranker.rerank(case_query, top_articles, min_keep=final_min_k, max_keep=final_max_k)
+        result         = predictor.predict(case_query, final_articles)
 
         submissions.append(
             {
                 "case_id": case_id,
                 "prediction": result.label,
-                "case_evidence": [
-                    c["chunk_id"]
-                    for c in chunks
-                ],
+
+                "case_evidence": [],
+
                 "law_evidence": [
                     {
-                        "law_id": a["law_id"],
-                        "aid": a["aid"],
+                        "law_id": article["law_id"],
+                        "aid": article["aid"],
                     }
-                    for a in final_articles
+                    for article in final_articles
                 ],
             }
         )
@@ -220,6 +148,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-sparse",       type=float, default=float(rc.get("weight_sparse", 0.4)))
     parser.add_argument("--use-colbert", action="store_true", default=bool(rc.get("use_colbert", False)))
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--test",   default=config.get("data", {}).get("public_test", "data/raw/ALQAC2026_public_test.json"))
     parser.add_argument("--corpus", default=config.get("data", {}).get("law_corpus", "data/raw/corpus_law_pub.json"))
     parser.add_argument("--output", default=config.get("output", {}).get("submissions_dir", "outputs/submissions"))
     parser.add_argument("--candidate-strategy", default=rc.get("candidate_strategy", "hybrid"),
@@ -234,6 +163,7 @@ def main() -> int:
     setup_logging(args.log_level)
     try:
         run_pipeline(
+            test_path=args.test,
             corpus_path=args.corpus,
             output_dir=args.output,
             rerank_mode=args.rerank_mode,
