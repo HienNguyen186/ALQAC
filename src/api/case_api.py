@@ -121,7 +121,7 @@ class CaseAPIClient:
             }
 
         self._wait_rate_limit()
-        headers = {"Authorization": f"Bearer {self.token}"}
+        headers = { "X-API-Key": self.token}
         payload = {"case_id": case_id, "query": query}
 
         resp = requests.post(
