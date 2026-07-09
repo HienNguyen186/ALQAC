@@ -104,6 +104,25 @@ class CaseAPIClient:
         if elapsed < self.rate_limit_sec:
             time.sleep(self.rate_limit_sec - elapsed)
 
+    def get_private_cases(self):
+        self._wait_rate_limit()
+
+        headers = {
+            "X-API-Key": self.token
+        }
+
+        resp = requests.get(
+            f"{self.base_url}/v1/private_test",
+            headers=headers,
+            timeout=30,
+        )
+
+        self._last_call_time = time.time()
+
+        resp.raise_for_status()
+
+        return resp.json()
+
     def search_case_segments(self, case_id: str, query: str) -> dict[str, Any]:
         """
         POST /v1/case_segments/search
@@ -125,7 +144,7 @@ class CaseAPIClient:
         payload = {"case_id": case_id, "query": query}
 
         resp = requests.post(
-            f"{self.base_url}/v1/case_segments/search",
+            f"{self.base_url}/retrieve",
             json=payload,
             headers=headers,
             timeout=30,
@@ -163,9 +182,14 @@ class CaseAPIClient:
                 LOGGER.warning("case_api query failed case_id=%s query=%r: %s", case_id, query, exc)
                 continue
 
-            result = response.get("result") or {}
-            hash_id = result.get("hash_id")
+            result = response.get("result", {})
+
+            hash_id = result.get("hash")
+
             text = result.get("text")
+
+            score = result.get("score", 1.0)
+
             if not text or hash_id in seen_hash:
                 continue
             seen_hash.add(hash_id)
@@ -173,10 +197,7 @@ class CaseAPIClient:
                 {
                     "chunk_id": hash_id,
                     "text": text,
-                    # Heuristic order-based score (BTC endpoint has no native
-                    # relevance score): case_query itself ranks highest, then
-                    # sub-queries in the order they were asked.
-                    "score": round(max(0.0, 1.0 - 0.15 * rank), 4),
+                    "score": score,
                     "query": query,
                 }
             )

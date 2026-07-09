@@ -110,7 +110,12 @@ def run_pipeline(
         mode="real",
     )
 
-    cases = validate_case_records(load_json_file(resolve_path(test_path, PROJECT_ROOT), "ALQAC public/private test set"))
+    LOGGER.info("Downloading private cases...")
+
+    cases = case_api.get_private_cases()
+
+    LOGGER.info("Received %d cases", len(cases))
+
     if limit is not None:
         cases = cases[:max(0, limit)]
     LOGGER.info("Loaded %s cases", len(cases))
@@ -215,7 +220,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-sparse",       type=float, default=float(rc.get("weight_sparse", 0.4)))
     parser.add_argument("--use-colbert", action="store_true", default=bool(rc.get("use_colbert", False)))
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--test",   default=config.get("data", {}).get("public_test", "data/raw/ALQAC2026_public_test.json"))
     parser.add_argument("--corpus", default=config.get("data", {}).get("law_corpus", "data/raw/corpus_law_pub.json"))
     parser.add_argument("--output", default=config.get("output", {}).get("submissions_dir", "outputs/submissions"))
     parser.add_argument("--candidate-strategy", default=rc.get("candidate_strategy", "hybrid"),
@@ -230,7 +234,6 @@ def main() -> int:
     setup_logging(args.log_level)
     try:
         run_pipeline(
-            test_path=args.test,
             corpus_path=args.corpus,
             output_dir=args.output,
             rerank_mode=args.rerank_mode,
