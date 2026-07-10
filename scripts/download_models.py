@@ -28,7 +28,7 @@ print(f"Cache directory: {cache_dir}")
 print()
 
 # ── BGE-M3 ────────────────────────────────────────────────────────────
-print("[1/3] Downloading BAAI/bge-m3 (~2.3 GB)...")
+print("[1/4] Downloading BAAI/bge-m3 (~2.3 GB)...")
 try:
     from FlagEmbedding import BGEM3FlagModel
     model = BGEM3FlagModel("BAAI/bge-m3", cache_dir=str(cache_dir))
@@ -38,8 +38,19 @@ except Exception as e:
 
 print()
 
+# ── Vietnamese Embedding ──────────────────────────────────────────────
+print("[2/4] Downloading dangvantuan/vietnamese-embedding (~400 MB)...")
+try:
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer("dangvantuan/vietnamese-embedding", cache_folder=str(cache_dir))
+    print("✓ Vietnamese embedding downloaded")
+except Exception as e:
+    print(f"✗ Vietnamese embedding failed: {e}")
+
+print()
+
 # ── Qwen2.5-3B ────────────────────────────────────────────────────────
-print("[2/3] Downloading Qwen/Qwen2.5-3B-Instruct (~7 GB)...")
+print("[3/4] Downloading Qwen/Qwen2.5-3B-Instruct (~7 GB)...")
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct", cache_dir=str(cache_dir))
@@ -56,7 +67,7 @@ except Exception as e:
 print()
 
 # ── Qwen3-8B ──────────────────────────────────────────────────────────
-print("[3/3] Downloading Qwen/Qwen3-8B (~15 GB)...")
+print("[4/4] Downloading Qwen/Qwen3-8B (~15 GB)...")
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B", cache_dir=str(cache_dir))

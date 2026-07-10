@@ -1,37 +1,37 @@
 # ALQAC 2026 — Pipeline Configuration
-# Tối ưu cho BGE-M3 hybrid (dense + sparse) với BM25 first-stage
+# Kiến trúc: Multi-Retrieval (BM25 + BGE-M3 + VN Embedding + Chunked) + LLM Reranker
 
 data:
   law_corpus:  "data/raw/corpus_law_pub.json"
   public_test: "data/raw/ALQAC2026_public_test.json"
 
 retrieval:
-  # ── BM25 first-stage ──────────────────────────────────────────────
-  # Tăng từ 100 → 200 để BGE-M3 có đủ candidate để re-rank.
-  # BM25 top-200 recall = 0.36 vs top-100 recall = 0.24.
+  # ── BM25 first-stage ─────────────────────────────────────────────
   bm25_top_k_articles: 200
+  bm25_top_k_laws:     5
+  bm25_strategy:       "hybrid"
 
-  # Số bộ luật dùng trong nhánh "law" của hybrid candidate pool.
-  bm25_top_k_laws: 5
-
-  # Chiến lược candidate pool: hybrid = article-branch ∪ law-branch.
-  candidate_strategy: "hybrid"
-
-  # ── BGE-M3 re-ranking ────────────────────────────────────────────
-  dense_model:      "BAAI/bge-m3"
-  dense_batch_size: 32          # Giảm nếu CPU RAM < 8 GB
-  dense_top_k:      30          # BGE-M3 nhận 200 candidate, trả về 30
-
-  # Trọng số hybrid: dense 0.6 + sparse 0.4 (theo paper BGE-M3)
+  # ── BGE-M3 (dense + sparse) ──────────────────────────────────────
+  bgem3_model:   "BAAI/bge-m3"
+  bgem3_top_k:   100
   weight_dense:  0.6
   weight_sparse: 0.4
 
-  # ColBERT: tắt mặc định (cần ~1.3 GB RAM thêm, chậm trên CPU)
-  use_colbert: false
+  # ── Vietnamese Embedding (PhoBERT) ───────────────────────────────
+  vn_model:  "dangvantuan/vietnamese-embedding"
+  vn_top_k:  100
 
-  # ── LLM reranker (sau BGE-M3) ────────────────────────────────────
-  # Ground truth median = 10 điều, mean = 10.8
-  # → tăng final_max_k lên 15 để không cắt cụt quá sớm
+  # ── Chunked BM25 (sliding window) ────────────────────────────────
+  chunked_top_k: 100
+
+  # ── RRF Fusion output ────────────────────────────────────────────
+  fusion_top_k: 500    # Tổng candidates sau union (input LLM reranker)
+
+  # ── Misc ─────────────────────────────────────────────────────────
+  batch_size: 32
+
+  # ── LLM Reranker ─────────────────────────────────────────────────
+  # GT median = 7 articles, mean = 8.3
   final_min_k: 3
   final_max_k: 15
 
