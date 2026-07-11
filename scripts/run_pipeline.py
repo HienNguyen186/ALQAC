@@ -1,4 +1,17 @@
-"""End-to-end ALQAC 2026 pipeline runner — Multi-Retrieval Architecture."""
+"""End-to-end ALQAC 2026 pipeline runner — Multi-Retrieval Architecture.
+
+Submission format (theo yêu cầu BTC):
+{
+  "case_id":      "case_1959",
+  "prediction":   "A_WIN",
+  "case_evidence": ["case_1959_seg_9b2898839a509e4f", ...],
+  "law_evidence":  [{"law_id": "91/2015/QH13", "aid": 52771}]
+}
+
+- case_evidence: chunk hash_id lấy từ Case Content API (search_case_segments)
+- law_evidence:  (law_id, aid) từ corpus
+- prediction:    1 trong 4 nhãn
+"""
 
 from __future__ import annotations
 
@@ -33,13 +46,78 @@ if _cache_dir.exists():
 
 from tqdm import tqdm
 
+from src.case_api import CaseAPIClient
 from src.prediction.llm_predictor import LLMPredictor
 from src.retrieval.multi_retriever import MultiRetriever
 from src.reranking.llm_reranker import LLMReranker
 from src.utils.config import load_config
-from src.utils.io import FriendlyFileError, load_json_file, resolve_path, setup_logging, validate_case_records
+from src.utils.io import (
+    FriendlyFileError,
+    load_json_file,
+    resolve_path,
+    setup_logging,
+    validate_case_records,
+)
 
 LOGGER = logging.getLogger(__name__)
+
+# ── Số lần gọi API per case để lấy case_evidence ────────────────────
+# Mỗi lần gọi lấy 1 chunk → gọi N lần với N query khác nhau
+# Rate limit: 1 req / 5 giây → N=3 tốn 15 giây/case
+# Tăng N sẽ tốn budget API và bị penalty nếu vượt ngưỡng
+DEFAULT_CASE_API_CALLS = 3
+
+
+def _build_case_queries(case_query: str, final_articles: list[dict[str, Any]]) -> list[str]:
+    """Sinh các query để gọi Case Content API.
+
+    Chiến lược: dùng case_query + tên các điều luật liên quan
+    để lấy đúng đoạn văn bản liên quan trong vụ án.
+    """
+    queries = [case_query]  # Query 1: toàn bộ case_query
+
+    # Query 2: tên điều luật quan trọng nhất (top-1)
+    if final_articles:
+        art = final_articles[0]
+        queries.append(f"{art.get('law_id', '')} điều {art.get('aid', '')}")
+
+    # Query 3: tóm tắt ngắn từ 50 ký tự đầu case_query
+    short = case_query[:80].strip()
+    if short not in queries:
+        queries.append(short)
+
+    return queries
+
+
+def _fetch_case_evidence(
+    client: CaseAPIClient,
+    case_id: str,
+    case_query: str,
+    final_articles: list[dict[str, Any]],
+    n_calls: int = DEFAULT_CASE_API_CALLS,
+) -> list[str]:
+    """Gọi Case Content API để lấy chunk hash_ids cho case_evidence.
+
+    Returns list of unique hash_ids (segment ids).
+    """
+    queries   = _build_case_queries(case_query, final_articles)[:n_calls]
+    hash_ids: list[str] = []
+    seen:     set[str]  = set()
+
+    for query in queries:
+        try:
+            resp = client.search_case_segments(case_id=case_id, query=query)
+            # Response: {"case_id": ..., "result": {"hash_id": ..., "text": ...}}
+            result  = resp.get("result", {})
+            hash_id = result.get("hash_id", "")
+            if hash_id and hash_id not in seen:
+                seen.add(hash_id)
+                hash_ids.append(hash_id)
+                LOGGER.debug("[CaseAPI] %s query=%r → %s", case_id, query[:40], hash_id)
+        except Exception as exc:
+            LOGGER.warning("[CaseAPI] %s failed (query=%r): %s", case_id, query[:40], exc)
+
+    return hash_ids
 
 
 def run_pipeline(
@@ -62,13 +140,16 @@ def run_pipeline(
     bgem3_top_k: int = 100,
     vn_top_k: int = 100,
     chunked_top_k: int = 100,
-    # Final fusion top_k (input cho LLM reranker)
+    # Final fusion top_k
     fusion_top_k: int = 500,
     # LLM params
     llm1_model: str = "Qwen/Qwen2.5-3B-Instruct",
     llm2_model: str = "Qwen/Qwen3-8B",
     final_min_k: int = 3,
     final_max_k: int = 15,
+    # Case Content API
+    use_case_api: bool = True,
+    case_api_calls: int = DEFAULT_CASE_API_CALLS,
     # Misc
     batch_size: int = 32,
     use_parallel: bool = True,
@@ -105,6 +186,19 @@ def run_pipeline(
     LOGGER.info("[Pipeline] Loading Predictor (mode=%s) ...", llm_mode)
     predictor = LLMPredictor(mode=llm_mode, model_name=llm2_model)
 
+    # ── Case Content API ─────────────────────────────────────────────
+    case_client: CaseAPIClient | None = None
+    if use_case_api:
+        token = os.getenv("ALQAC_API_TOKEN", "")
+        if token:
+            case_client = CaseAPIClient(token=token)
+            LOGGER.info("[Pipeline] Case API enabled (%d calls/case)", case_api_calls)
+        else:
+            LOGGER.warning(
+                "[Pipeline] ALQAC_API_TOKEN not set — case_evidence will be empty. "
+                "Set token in .env file: ALQAC_API_TOKEN=your_token_here"
+            )
+
     # ── Load test data ────────────────────────────────────────────────
     cases = validate_case_records(
         load_json_file(resolve_path(test_path, PROJECT_ROOT), "ALQAC test set")
@@ -115,6 +209,7 @@ def run_pipeline(
 
     # ── Inference loop ────────────────────────────────────────────────
     submissions: list[dict[str, Any]] = []
+
     for case in tqdm(cases, desc="Pipeline"):
         case_id    = str(case["case_id"])
         case_query = str(case["case_query"])
@@ -122,7 +217,7 @@ def run_pipeline(
         # Tầng 1: Multi-retrieval → fused candidate pool
         candidates = multi_retriever.retrieve(case_query, final_top_k=fusion_top_k)
 
-        # Tầng 2: LLM reranker → top-15 relevant articles
+        # Tầng 2: LLM reranker → top-N relevant articles
         final_articles = llm_reranker.rerank(
             case_query, candidates,
             min_keep=final_min_k,
@@ -132,10 +227,23 @@ def run_pipeline(
         # Tầng 3: Predict verdict
         result = predictor.predict(case_query, final_articles)
 
+        # ── Case Content API → case_evidence chunk ids ────────────────
+        if case_client is not None:
+            chunk_ids = _fetch_case_evidence(
+                client=case_client,
+                case_id=case_id,
+                case_query=case_query,
+                final_articles=final_articles,
+                n_calls=case_api_calls,
+            )
+        else:
+            chunk_ids = []
+
+        # ── Build submission item (đúng format BTC) ───────────────────
         submissions.append({
-            "case_id":    case_id,
-            "prediction": result.label,
-            "confidence": round(float(result.confidence), 4),
+            "case_id":       case_id,
+            "prediction":    result.label,
+            "case_evidence": chunk_ids,
             "law_evidence": [
                 {"law_id": a.get("law_id"), "aid": a.get("aid")}
                 for a in final_articles
@@ -177,7 +285,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bm25-top-k-articles", type=int, default=int(rc.get("bm25_top_k_articles", 200)))
     p.add_argument("--bm25-top-k-laws",     type=int, default=int(rc.get("bm25_top_k_laws", 5)))
     p.add_argument("--bm25-strategy",       default=rc.get("bm25_strategy", "hybrid"),
-                   choices=["article","law","hybrid"])
+                   choices=["article", "law", "hybrid"])
 
     # Per-retriever top_k
     p.add_argument("--bgem3-top-k",   type=int, default=int(rc.get("bgem3_top_k",   100)))
@@ -193,13 +301,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--final-min-k", type=int, default=int(rc.get("final_min_k", 3)))
     p.add_argument("--final-max-k", type=int, default=int(rc.get("final_max_k", 15)))
 
+    # Case Content API
+    p.add_argument("--no-case-api",    action="store_true",
+                   help="Tắt Case Content API (case_evidence sẽ rỗng)")
+    p.add_argument("--case-api-calls", type=int, default=DEFAULT_CASE_API_CALLS,
+                   help=f"Số lần gọi API per case (default={DEFAULT_CASE_API_CALLS}, rate-limit 1/5s)")
+
     # Misc
-    p.add_argument("--batch-size",    type=int,  default=int(rc.get("batch_size", 32)))
-    p.add_argument("--no-parallel",   action="store_true")
-    p.add_argument("--limit",         type=int,  default=None)
-    p.add_argument("--test",   default=cfg.get("data",{}).get("public_test",  "data/raw/ALQAC2026_public_test.json"))
-    p.add_argument("--corpus", default=cfg.get("data",{}).get("law_corpus",   "data/raw/corpus_law_pub.json"))
-    p.add_argument("--output", default=cfg.get("output",{}).get("submissions_dir", "outputs/submissions"))
+    p.add_argument("--batch-size",  type=int, default=int(rc.get("batch_size", 32)))
+    p.add_argument("--no-parallel", action="store_true")
+    p.add_argument("--limit",       type=int, default=None)
+    p.add_argument("--test",   default=cfg.get("data", {}).get("public_test",  "data/raw/ALQAC2026_public_test.json"))
+    p.add_argument("--corpus", default=cfg.get("data", {}).get("law_corpus",   "data/raw/corpus_law_pub.json"))
+    p.add_argument("--output", default=cfg.get("output", {}).get("submissions_dir", "outputs/submissions"))
     p.add_argument("--log-level", default="INFO")
     return p
 
@@ -230,6 +344,8 @@ def main() -> int:
             weight_sparse=args.weight_sparse,
             final_min_k=args.final_min_k,
             final_max_k=args.final_max_k,
+            use_case_api=not args.no_case_api,
+            case_api_calls=args.case_api_calls,
             batch_size=args.batch_size,
             use_parallel=not args.no_parallel,
             limit=args.limit,
