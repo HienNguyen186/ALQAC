@@ -46,7 +46,7 @@ if _cache_dir.exists():
 
 from tqdm import tqdm
 
-from src.case_api import CaseAPIClient
+from src.api.case_api import CaseAPIClient
 from src.prediction.llm_predictor import LLMPredictor
 from src.retrieval.multi_retriever import MultiRetriever
 from src.reranking.llm_reranker import LLMReranker
