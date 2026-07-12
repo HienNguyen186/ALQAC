@@ -111,24 +111,54 @@ class LLMReranker:
         import torch
 
         prompt   = RELEVANCE_PROMPT.format(
-            query=query[:900].strip(),
+            query=query[:500].strip(),      # Giới hạn query (giảm từ 900)
             law_id=article.get("law_id", ""),
             aid=article.get("aid", ""),
-            article=str(article.get("content", ""))[:1000].strip(),
+            article=str(article.get("content", ""))[:600].strip(),  # Giảm từ 1000
         )
         messages = [{"role": "user", "content": prompt}]
-        text     = self._tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs   = self._tokenizer(text, return_tensors="pt").to(self._model.device)
+        
+        try:
+            text = self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            # Fallback nếu apply_chat_template fail
+            text = prompt
+
+        # Tokenize với max_length — sẽ truncate thay vì crash
+        inputs = self._tokenizer(
+            text,
+            return_tensors="pt",
+            max_length=512,           # Giới hạn strictly
+            truncation=True,
+            padding="max_length",
+        ).to(self._model.device)
 
         with torch.no_grad():
-            out = self._model.generate(
-                **inputs,
-                max_new_tokens=4,
-                do_sample=False,
-                temperature=None,
-                top_p=None,
-                pad_token_id=self._tokenizer.eos_token_id,
-            )
+            try:
+                out = self._model.generate(
+                    **inputs,
+                    max_new_tokens=4,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    use_cache=False,  # Disable KV cache để tránh OOM
+                    pad_token_id=self._tokenizer.eos_token_id,
+                )
+            except RuntimeError as e:
+                # Nếu vẫn crash → fallback: coi như relevant
+                LOGGER.warning("[LLMReranker] Generate failed: %s, fallback to True", e)
+                return True
+            finally:
+                # Clear GPU cache sau generate
+                try:
+                    torch.cuda.empty_cache()
+                except:
+                    pass
+
         new_tokens = out[0][inputs["input_ids"].shape[1]:]
         response   = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
         return _parse_yes_no(response)
