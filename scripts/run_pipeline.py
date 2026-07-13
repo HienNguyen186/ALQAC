@@ -1,16 +1,23 @@
-"""End-to-end ALQAC 2026 pipeline runner — Multi-Retrieval Architecture.
+"""End-to-end ALQAC 2026 pipeline runner — Multi-Retrieval + Ensemble Reranking.
 
-Submission format (theo yêu cầu BTC):
-{
-  "case_id":      "case_1959",
-  "prediction":   "A_WIN",
-  "case_evidence": ["case_1959_seg_9b2898839a509e4f", ...],
-  "law_evidence":  [{"law_id": "91/2015/QH13", "aid": 52771}]
-}
+Kiến trúc:
+  Tầng 1 — Multi-Retrieval (song song):
+    BM25 + BGE-M3 + Vietnamese Embedding + Chunked BM25
+    → RRF fusion → ~500 candidates
 
-- case_evidence: chunk hash_id lấy từ Case Content API (search_case_segments)
-- law_evidence:  (law_id, aid) từ corpus
-- prediction:    1 trong 4 nhãn
+  Tầng 2 — Ensemble Reranking (nối tiếp):
+    CrossEncoder (mmarco-MiniLM) → top-200
+    Qwen3-Reranker-0.6B          → top-50
+    LLMReranker (Qwen2.5-3B)     → hard filter
+    → weighted ensemble → top-15
+
+  Tầng 3 — Prediction:
+    Qwen3-8B → verdict label
+
+  Case Content API → case_evidence chunk ids
+
+Submission format:
+  {"case_id", "prediction", "case_evidence": [...], "law_evidence": [{law_id, aid}]}
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# ── Setup HF cache offline ───────────────────────────────────────────
+# ── Offline HF cache ─────────────────────────────────────────────────
 _env_file = PROJECT_ROOT / ".env"
 if _env_file.exists():
     for _line in _env_file.read_text(encoding="utf-8").splitlines():
@@ -46,10 +53,10 @@ if _cache_dir.exists():
 
 from tqdm import tqdm
 
-from src.api.case_api import CaseAPIClient
+from src.case_api import CaseAPIClient
 from src.prediction.llm_predictor import LLMPredictor
 from src.retrieval.multi_retriever import MultiRetriever
-from src.reranking.llm_reranker import LLMReranker
+from src.reranking.ensemble_reranker import EnsembleReranker
 from src.utils.config import load_config
 from src.utils.io import (
     FriendlyFileError,
@@ -61,31 +68,20 @@ from src.utils.io import (
 
 LOGGER = logging.getLogger(__name__)
 
-# ── Số lần gọi API per case để lấy case_evidence ────────────────────
-# Mỗi lần gọi lấy 1 chunk → gọi N lần với N query khác nhau
-# Rate limit: 1 req / 5 giây → N=3 tốn 15 giây/case
-# Tăng N sẽ tốn budget API và bị penalty nếu vượt ngưỡng
 DEFAULT_CASE_API_CALLS = 3
 
 
-def _build_case_queries(case_query: str, final_articles: list[dict[str, Any]]) -> list[str]:
-    """Sinh các query để gọi Case Content API.
-
-    Chiến lược: dùng case_query + tên các điều luật liên quan
-    để lấy đúng đoạn văn bản liên quan trong vụ án.
-    """
-    queries = [case_query]  # Query 1: toàn bộ case_query
-
-    # Query 2: tên điều luật quan trọng nhất (top-1)
+def _build_case_queries(
+    case_query: str,
+    final_articles: list[dict[str, Any]],
+) -> list[str]:
+    queries = [case_query]
     if final_articles:
         art = final_articles[0]
         queries.append(f"{art.get('law_id', '')} điều {art.get('aid', '')}")
-
-    # Query 3: tóm tắt ngắn từ 50 ký tự đầu case_query
     short = case_query[:80].strip()
     if short not in queries:
         queries.append(short)
-
     return queries
 
 
@@ -96,27 +92,20 @@ def _fetch_case_evidence(
     final_articles: list[dict[str, Any]],
     n_calls: int = DEFAULT_CASE_API_CALLS,
 ) -> list[str]:
-    """Gọi Case Content API để lấy chunk hash_ids cho case_evidence.
-
-    Returns list of unique hash_ids (segment ids).
-    """
-    queries   = _build_case_queries(case_query, final_articles)[:n_calls]
+    queries  = _build_case_queries(case_query, final_articles)[:n_calls]
     hash_ids: list[str] = []
     seen:     set[str]  = set()
-
     for query in queries:
         try:
-            resp = client.search_case_segments(case_id=case_id, query=query)
-            # Response: {"case_id": ..., "result": {"hash_id": ..., "text": ...}}
+            resp    = client.search_case_segments(case_id=case_id, query=query)
             result  = resp.get("result", {})
             hash_id = result.get("hash_id", "")
             if hash_id and hash_id not in seen:
                 seen.add(hash_id)
                 hash_ids.append(hash_id)
-                LOGGER.debug("[CaseAPI] %s query=%r → %s", case_id, query[:40], hash_id)
+                LOGGER.debug("[CaseAPI] %s → %s", case_id, hash_id)
         except Exception as exc:
-            LOGGER.warning("[CaseAPI] %s failed (query=%r): %s", case_id, query[:40], exc)
-
+            LOGGER.warning("[CaseAPI] %s failed: %s", case_id, exc)
     return hash_ids
 
 
@@ -126,41 +115,46 @@ def run_pipeline(
     output_dir: str | Path,
     rerank_mode: str = "local",
     llm_mode: str = "local",
-    # BGE-M3
+    # ── Tầng 1: Multi-Retrieval ──────────────────────────────────
     bgem3_model: str = "BAAI/bge-m3",
-    weight_dense: float = 0.6,
+    vn_model: str    = "dangvantuan/vietnamese-embedding",
+    weight_dense: float  = 0.6,
     weight_sparse: float = 0.4,
-    # Vietnamese embedding
-    vn_model: str = "dangvantuan/vietnamese-embedding",
-    # BM25 params
     bm25_top_k_articles: int = 200,
     bm25_top_k_laws: int = 5,
-    bm25_strategy: str = "hybrid",
-    # Per-retriever top_k
-    bgem3_top_k: int = 100,
-    vn_top_k: int = 100,
-    chunked_top_k: int = 100,
-    # Final fusion top_k
-    fusion_top_k: int = 500,
-    # LLM params
-    llm1_model: str = "Qwen/Qwen2.5-3B-Instruct",
-    llm2_model: str = "Qwen/Qwen3-8B",
-    final_min_k: int = 3,
-    final_max_k: int = 15,
-    # Case Content API
-    use_case_api: bool = True,
+    bm25_strategy: str   = "hybrid",
+    bgem3_top_k: int    = 100,
+    vn_top_k: int       = 100,
+    chunked_top_k: int  = 100,
+    fusion_top_k: int   = 500,
+    use_parallel: bool  = True,
+    # ── Tầng 2: Ensemble Reranker ────────────────────────────────
+    cross_model: str    = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    qwen3_model: str    = "Qwen/Qwen3-Reranker-0.6B",
+    llm1_model: str     = "Qwen/Qwen2.5-3B-Instruct",
+    weight_cross: float = 0.35,
+    weight_qwen3: float = 0.50,
+    weight_llm: float   = 0.15,
+    cross_top_k: int    = 200,
+    qwen3_top_k: int    = 50,
+    final_min_k: int    = 3,
+    final_max_k: int    = 15,
+    use_llm_filter: bool = True,
+    # ── Tầng 3: Prediction ───────────────────────────────────────
+    llm2_model: str     = "Qwen/Qwen3-8B",
+    # ── Case Content API ─────────────────────────────────────────
+    use_case_api: bool  = True,
     case_api_calls: int = DEFAULT_CASE_API_CALLS,
-    # Misc
-    batch_size: int = 32,
-    use_parallel: bool = True,
-    limit: int | None = None,
+    # ── Misc ─────────────────────────────────────────────────────
+    batch_size: int     = 32,
+    limit: int | None   = None,
 ) -> str:
-    """Run Multi-Retrieval pipeline for ALQAC cases."""
+    """Run full pipeline: Multi-Retrieval → Ensemble Rerank → Predict."""
 
     corpus_resolved = resolve_path(corpus_path, PROJECT_ROOT)
 
     # ── Tầng 1: Multi-Retrieval ──────────────────────────────────────
-    LOGGER.info("[Pipeline] Initializing Multi-Retriever (mode=%s) ...", rerank_mode)
+    LOGGER.info("[Pipeline] ── Tầng 1: Multi-Retrieval (mode=%s) ──", rerank_mode)
     multi_retriever = MultiRetriever(
         mode=rerank_mode,
         corpus_path=corpus_resolved,
@@ -172,18 +166,32 @@ def run_pipeline(
         chunked_top_k=chunked_top_k,
         vn_model=vn_model,
         bgem3_model=bgem3_model,
-        batch_size=batch_size,
+        batch_size=8,  # ← Giảm từ 32 → 8 (GPU optimization)
         weight_dense=weight_dense,
         weight_sparse=weight_sparse,
         use_parallel=use_parallel,
     )
 
-    # ── Tầng 2: LLM Reranker ─────────────────────────────────────────
-    LOGGER.info("[Pipeline] Loading LLM Reranker (mode=%s) ...", rerank_mode)
-    llm_reranker = LLMReranker(mode=rerank_mode, model_name=llm1_model)
+    # ── Tầng 2: Ensemble Reranker ────────────────────────────────────
+    LOGGER.info("[Pipeline] ── Tầng 2: Ensemble Reranker (mode=%s) ──", rerank_mode)
+    ensemble = EnsembleReranker(
+        mode=rerank_mode,
+        cross_model=cross_model,
+        qwen3_model=qwen3_model,
+        llm_model=llm1_model,
+        weight_cross=weight_cross,
+        weight_qwen3=weight_qwen3,
+        weight_llm=weight_llm,
+        cross_top_k=cross_top_k,
+        qwen3_top_k=qwen3_top_k,
+        final_min_k=final_min_k,
+        final_max_k=final_max_k,
+        use_llm_filter=use_llm_filter,
+        batch_size=8,  # ← Giảm từ 32 → 8 (GPU optimization)
+    )
 
     # ── Tầng 3: Predictor ────────────────────────────────────────────
-    LOGGER.info("[Pipeline] Loading Predictor (mode=%s) ...", llm_mode)
+    LOGGER.info("[Pipeline] ── Tầng 3: Predictor (mode=%s) ──", llm_mode)
     predictor = LLMPredictor(mode=llm_mode, model_name=llm2_model)
 
     # ── Case Content API ─────────────────────────────────────────────
@@ -195,8 +203,8 @@ def run_pipeline(
             LOGGER.info("[Pipeline] Case API enabled (%d calls/case)", case_api_calls)
         else:
             LOGGER.warning(
-                "[Pipeline] ALQAC_API_TOKEN not set — case_evidence will be empty. "
-                "Set token in .env file: ALQAC_API_TOKEN=your_token_here"
+                "[Pipeline] ALQAC_API_TOKEN chưa set → case_evidence sẽ rỗng. "
+                "Thêm token vào .env: ALQAC_API_TOKEN=your_token"
             )
 
     # ── Load test data ────────────────────────────────────────────────
@@ -214,20 +222,17 @@ def run_pipeline(
         case_id    = str(case["case_id"])
         case_query = str(case["case_query"])
 
-        # Tầng 1: Multi-retrieval → fused candidate pool
+        # Tầng 1 → ~500 candidates (RRF fused)
         candidates = multi_retriever.retrieve(case_query, final_top_k=fusion_top_k)
 
-        # Tầng 2: LLM reranker → top-N relevant articles
-        final_articles = llm_reranker.rerank(
-            case_query, candidates,
-            min_keep=final_min_k,
-            max_keep=final_max_k,
-        )
+        # Tầng 2 → top-15 (ensemble scored)
+        final_articles = ensemble.rerank(case_query, candidates)
 
-        # Tầng 3: Predict verdict
+        # Tầng 3 → verdict label
         result = predictor.predict(case_query, final_articles)
 
-        # ── Case Content API → case_evidence chunk ids ────────────────
+        # Case Content API → chunk hash_ids
+        chunk_ids = []
         if case_client is not None:
             chunk_ids = _fetch_case_evidence(
                 client=case_client,
@@ -236,10 +241,7 @@ def run_pipeline(
                 final_articles=final_articles,
                 n_calls=case_api_calls,
             )
-        else:
-            chunk_ids = []
 
-        # ── Build submission item (đúng format BTC) ───────────────────
         submissions.append({
             "case_id":       case_id,
             "prediction":    result.label,
@@ -250,7 +252,7 @@ def run_pipeline(
             ],
         })
 
-    # ── Save output ───────────────────────────────────────────────────
+    # ── Save ─────────────────────────────────────────────────────────
     out_dir = resolve_path(output_dir, PROJECT_ROOT)
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -267,53 +269,60 @@ def run_pipeline(
 def build_arg_parser() -> argparse.ArgumentParser:
     cfg = load_config()
     rc  = cfg.get("retrieval", {})
+    rc2 = cfg.get("reranking", {})
     pc  = cfg.get("prediction", {})
 
-    p = argparse.ArgumentParser(description="ALQAC 2026 Multi-Retrieval Pipeline")
+    p = argparse.ArgumentParser(description="ALQAC 2026 — Multi-Retrieval + Ensemble Reranking")
 
     # Mode
-    p.add_argument("--rerank-mode", default="local",  choices=["mock", "local"])
-    p.add_argument("--llm-mode",    default="local",  choices=["mock", "local"])
+    p.add_argument("--rerank-mode", default="local", choices=["mock", "local"])
+    p.add_argument("--llm-mode",    default="local", choices=["mock", "local"])
 
-    # Models
-    p.add_argument("--bgem3-model", default=rc.get("bgem3_model",    "BAAI/bge-m3"))
-    p.add_argument("--vn-model",    default=rc.get("vn_model",       "dangvantuan/vietnamese-embedding"))
-    p.add_argument("--llm1-model",  default=pc.get("reranker_model", "Qwen/Qwen2.5-3B-Instruct"))
-    p.add_argument("--llm2-model",  default=pc.get("predictor_model","Qwen/Qwen3-8B"))
+    # ── Tầng 1 models ────────────────────────────────────────────────
+    p.add_argument("--bgem3-model", default=rc.get("bgem3_model",  "BAAI/bge-m3"))
+    p.add_argument("--vn-model",    default=rc.get("vn_model",     "dangvantuan/vietnamese-embedding"))
 
-    # BM25
-    p.add_argument("--bm25-top-k-articles", type=int, default=int(rc.get("bm25_top_k_articles", 200)))
-    p.add_argument("--bm25-top-k-laws",     type=int, default=int(rc.get("bm25_top_k_laws", 5)))
+    # ── Tầng 1 params ────────────────────────────────────────────────
+    p.add_argument("--bm25-top-k-articles", type=int,   default=int(rc.get("bm25_top_k_articles", 200)))
+    p.add_argument("--bm25-top-k-laws",     type=int,   default=int(rc.get("bm25_top_k_laws",     5)))
     p.add_argument("--bm25-strategy",       default=rc.get("bm25_strategy", "hybrid"),
                    choices=["article", "law", "hybrid"])
+    p.add_argument("--bgem3-top-k",         type=int,   default=int(rc.get("bgem3_top_k",   100)))
+    p.add_argument("--vn-top-k",            type=int,   default=int(rc.get("vn_top_k",      100)))
+    p.add_argument("--chunked-top-k",       type=int,   default=int(rc.get("chunked_top_k", 100)))
+    p.add_argument("--fusion-top-k",        type=int,   default=int(rc.get("fusion_top_k",  500)))
+    p.add_argument("--weight-dense",        type=float, default=float(rc.get("weight_dense",  0.6)))
+    p.add_argument("--weight-sparse",       type=float, default=float(rc.get("weight_sparse", 0.4)))
 
-    # Per-retriever top_k
-    p.add_argument("--bgem3-top-k",   type=int, default=int(rc.get("bgem3_top_k",   100)))
-    p.add_argument("--vn-top-k",      type=int, default=int(rc.get("vn_top_k",      100)))
-    p.add_argument("--chunked-top-k", type=int, default=int(rc.get("chunked_top_k", 100)))
-    p.add_argument("--fusion-top-k",  type=int, default=int(rc.get("fusion_top_k",  500)))
+    # ── Tầng 2 models ────────────────────────────────────────────────
+    p.add_argument("--cross-model", default=rc2.get("cross_model",  "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"))
+    p.add_argument("--qwen3-model", default=rc2.get("qwen3_model",  "Qwen/Qwen3-Reranker-0.6B"))
+    p.add_argument("--llm1-model",  default=rc2.get("llm_model",    "Qwen/Qwen2.5-3B-Instruct"))
 
-    # BGE-M3 weights
-    p.add_argument("--weight-dense",  type=float, default=float(rc.get("weight_dense",  0.6)))
-    p.add_argument("--weight-sparse", type=float, default=float(rc.get("weight_sparse", 0.4)))
+    # ── Tầng 2 params ────────────────────────────────────────────────
+    p.add_argument("--weight-cross",     type=float, default=float(rc2.get("weight_cross", 0.35)))
+    p.add_argument("--weight-qwen3",     type=float, default=float(rc2.get("weight_qwen3", 0.50)))
+    p.add_argument("--weight-llm",       type=float, default=float(rc2.get("weight_llm",   0.15)))
+    p.add_argument("--cross-top-k",      type=int,   default=int(rc2.get("cross_top_k",    200)))
+    p.add_argument("--qwen3-top-k",      type=int,   default=int(rc2.get("qwen3_top_k",    50)))
+    p.add_argument("--final-min-k",      type=int,   default=int(rc2.get("final_min_k",    3)))
+    p.add_argument("--final-max-k",      type=int,   default=int(rc2.get("final_max_k",    15)))
+    p.add_argument("--no-llm-filter",    action="store_true")
 
-    # LLM reranker
-    p.add_argument("--final-min-k", type=int, default=int(rc.get("final_min_k", 3)))
-    p.add_argument("--final-max-k", type=int, default=int(rc.get("final_max_k", 15)))
+    # ── Tầng 3 model ─────────────────────────────────────────────────
+    p.add_argument("--llm2-model", default=pc.get("predictor_model", "Qwen/Qwen3-8B"))
 
-    # Case Content API
-    p.add_argument("--no-case-api",    action="store_true",
-                   help="Tắt Case Content API (case_evidence sẽ rỗng)")
-    p.add_argument("--case-api-calls", type=int, default=DEFAULT_CASE_API_CALLS,
-                   help=f"Số lần gọi API per case (default={DEFAULT_CASE_API_CALLS}, rate-limit 1/5s)")
+    # ── Case API ─────────────────────────────────────────────────────
+    p.add_argument("--no-case-api",    action="store_true")
+    p.add_argument("--case-api-calls", type=int, default=DEFAULT_CASE_API_CALLS)
 
-    # Misc
-    p.add_argument("--batch-size",  type=int, default=int(rc.get("batch_size", 32)))
+    # ── Misc ─────────────────────────────────────────────────────────
+    p.add_argument("--batch-size",  type=int,  default=int(rc.get("batch_size", 32)))
     p.add_argument("--no-parallel", action="store_true")
-    p.add_argument("--limit",       type=int, default=None)
-    p.add_argument("--test",   default=cfg.get("data", {}).get("public_test",  "data/raw/ALQAC2026_public_test.json"))
-    p.add_argument("--corpus", default=cfg.get("data", {}).get("law_corpus",   "data/raw/corpus_law_pub.json"))
-    p.add_argument("--output", default=cfg.get("output", {}).get("submissions_dir", "outputs/submissions"))
+    p.add_argument("--limit",       type=int,  default=None)
+    p.add_argument("--test",   default=cfg.get("data",   {}).get("public_test",      "data/raw/ALQAC2026_public_test.json"))
+    p.add_argument("--corpus", default=cfg.get("data",   {}).get("law_corpus",       "data/raw/corpus_law_pub.json"))
+    p.add_argument("--output", default=cfg.get("output", {}).get("submissions_dir",  "outputs/submissions"))
     p.add_argument("--log-level", default="INFO")
     return p
 
@@ -331,8 +340,8 @@ def main() -> int:
             llm_mode=args.llm_mode,
             bgem3_model=args.bgem3_model,
             vn_model=args.vn_model,
-            llm1_model=args.llm1_model,
-            llm2_model=args.llm2_model,
+            weight_dense=args.weight_dense,
+            weight_sparse=args.weight_sparse,
             bm25_top_k_articles=args.bm25_top_k_articles,
             bm25_top_k_laws=args.bm25_top_k_laws,
             bm25_strategy=args.bm25_strategy,
@@ -340,14 +349,22 @@ def main() -> int:
             vn_top_k=args.vn_top_k,
             chunked_top_k=args.chunked_top_k,
             fusion_top_k=args.fusion_top_k,
-            weight_dense=args.weight_dense,
-            weight_sparse=args.weight_sparse,
+            use_parallel=not args.no_parallel,
+            cross_model=args.cross_model,
+            qwen3_model=args.qwen3_model,
+            llm1_model=args.llm1_model,
+            weight_cross=args.weight_cross,
+            weight_qwen3=args.weight_qwen3,
+            weight_llm=args.weight_llm,
+            cross_top_k=args.cross_top_k,
+            qwen3_top_k=args.qwen3_top_k,
             final_min_k=args.final_min_k,
             final_max_k=args.final_max_k,
+            use_llm_filter=not args.no_llm_filter,
+            llm2_model=args.llm2_model,
             use_case_api=not args.no_case_api,
             case_api_calls=args.case_api_calls,
             batch_size=args.batch_size,
-            use_parallel=not args.no_parallel,
             limit=args.limit,
         )
     except FriendlyFileError as exc:

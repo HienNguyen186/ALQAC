@@ -111,10 +111,10 @@ class LLMReranker:
         import torch
 
         prompt   = RELEVANCE_PROMPT.format(
-            query=query[:500].strip(),      # Giới hạn query (giảm từ 900)
+            query=query[:300].strip(),      # ← Giảm từ 500 → 300
             law_id=article.get("law_id", ""),
             aid=article.get("aid", ""),
-            article=str(article.get("content", ""))[:600].strip(),  # Giảm từ 1000
+            article=str(article.get("content", ""))[:400].strip(),  # ← Giảm từ 600 → 400
         )
         messages = [{"role": "user", "content": prompt}]
         
@@ -132,7 +132,7 @@ class LLMReranker:
         inputs = self._tokenizer(
             text,
             return_tensors="pt",
-            max_length=512,           # Giới hạn strictly
+            max_length=256,           # ← Giảm từ 512 → 256 (GPU optimization)
             truncation=True,
             padding="max_length",
         ).to(self._model.device)

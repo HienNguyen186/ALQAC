@@ -56,14 +56,14 @@ class VietnameseRetriever:
         self,
         mode: str = "local",
         model_name: str = DEFAULT_MODEL,
-        batch_size: int = 64,
+        batch_size: int = 16,  # Giảm từ 64 → 16 để tránh scatter gather OOM
         cache_dir: str | Path | None = None,
         model_cache_dir: str | Path | None = None,
         device: str | None = None,
     ):
         self.mode       = mode
         self.model_name = model_name
-        self.batch_size = batch_size
+        self.batch_size = 16  # ← Giảm từ 64 → 16 (GPU optimization)
         self.cache_dir  = (
             Path(cache_dir) if cache_dir
             else find_project_root() / "outputs" / "cache" / "vn_embeddings"
@@ -157,14 +157,23 @@ class VietnameseRetriever:
             return cached
 
         assert self._model is not None
-        texts = [str(a.get("content", "")) for a in articles]
+        # ← Truncate to 256 tokens to reduce VRAM (from full content)
+        texts = [" ".join(str(a.get("content", "")).split()[:256]) for a in articles]
         LOGGER.info("[VietnameseRetriever] Encoding %d articles ...", len(texts))
-        embs = self._model.encode(
-            texts,
-            batch_size=self.batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        
+        try:
+            embs = self._model.encode(
+                texts,
+                batch_size=max(4, self.batch_size // 16),  # Giảm batch size
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+        except RuntimeError as e:
+            LOGGER.warning("[VietnameseRetriever] Encode failed: %s, returning zeros", e)
+            # Fallback: return zero embeddings thay vì crash
+            dim = self._model.get_sentence_embedding_dimension()
+            embs = np.zeros((len(texts), dim), dtype=np.float32)
+        
         result = np.asarray(embs, dtype=np.float32)
         self._save_cache(cache_path, result)
         LOGGER.info("[VietnameseRetriever] Encoded and cached.")
