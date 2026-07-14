@@ -171,6 +171,10 @@ def run_pipeline(
         weight_sparse=weight_sparse,
         use_parallel=use_parallel,
     )
+    
+    # ← Disable Vietnamese Embedding (CUDA scatter gather error)
+    multi_retriever.vn_retriever = None
+    LOGGER.info('[Pipeline] Disabled Vietnamese Embedding (CUDA optimization)')
 
     # ── Tầng 2: Ensemble Reranker ────────────────────────────────────
     LOGGER.info("[Pipeline] ── Tầng 2: Ensemble Reranker (mode=%s) ──", rerank_mode)
