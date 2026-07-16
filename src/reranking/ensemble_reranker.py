@@ -180,12 +180,13 @@ class EnsembleReranker:
         top_cross_scores = cross_scores[top_cross_idx]
 
         # ── Bước 2: Qwen3Reranker score top qwen3_top_k ──────────────
-        # Chỉ lấy top qwen3_top_k từ CrossEncoder để tiết kiệm VRAM
+        # DISABLED: Tokenizer incompatibility (Qwen2Tokenizer.prepare_for_model)
         qwen3_input   = top_candidates[:self.qwen3_top_k]
         qwen3_input_cross = top_cross_scores[:self.qwen3_top_k]
 
-        LOGGER.info("[EnsembleReranker] Step 2: Qwen3Reranker (%d candidates) ...", len(qwen3_input))
-        qwen3_scores = self.qwen3.score(query, qwen3_input)
+        LOGGER.info("[EnsembleReranker] Step 2: Qwen3Reranker DISABLED (tokenizer error)")
+        # qwen3_scores = self.qwen3.score(query, qwen3_input)
+        qwen3_scores = [0.0] * len(qwen3_input)  # Use 0 score when disabled
 
         # Bản đồ (law_id, aid) → qwen3 score
         qwen3_map: dict[tuple, float] = {}
