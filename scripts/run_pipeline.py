@@ -97,13 +97,15 @@ def _fetch_case_evidence(
     seen:     set[str]  = set()
     for query in queries:
         try:
-            resp    = client.search_case_segments(case_id=case_id, query=query)
-            result  = resp.get("result", {})
-            hash_id = result.get("hash_id", "")
-            if hash_id and hash_id not in seen:
-                seen.add(hash_id)
-                hash_ids.append(hash_id)
-                LOGGER.debug("[CaseAPI] %s → %s", case_id, hash_id)
+            resp     = client.search_case_segments(case_id=case_id, query=query)
+            # API trả về: {"results": [{"score": float, "text": str, "chunk_id": str}]}
+            results  = resp.get("results", [])
+            chunk_id = results[0].get("chunk_id", "") if results else ""
+            if chunk_id and chunk_id not in seen:
+                seen.add(chunk_id)
+                hash_ids.append(chunk_id)
+                score = results[0].get("score", "?")
+                LOGGER.debug("[CaseAPI] %s → %s (score=%.3f)", case_id, chunk_id, score)
         except Exception as exc:
             LOGGER.warning("[CaseAPI] %s failed: %s", case_id, exc)
     return hash_ids
