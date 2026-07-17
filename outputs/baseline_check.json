@@ -1,0 +1,12 @@
+{
+  "total_labeled": 50,
+  "missing_label": 0,
+  "distribution": {
+    "PARTIAL_A_WIN": 19,
+    "A_WIN": 16,
+    "B_WIN": 10,
+    "PARTIAL_B_WIN": 5
+  },
+  "majority_label": "PARTIAL_A_WIN",
+  "majority_baseline_accuracy": 0.38
+}

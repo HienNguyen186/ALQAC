@@ -53,7 +53,7 @@ if _cache_dir.exists():
 
 from tqdm import tqdm
 
-from src.case_api import CaseAPIClient
+from src.api.case_api import CaseAPIClient
 from src.prediction.llm_predictor import LLMPredictor
 from src.retrieval.multi_retriever import MultiRetriever
 from src.reranking.ensemble_reranker import EnsembleReranker
@@ -122,7 +122,7 @@ def run_pipeline(
     vn_model: str    = "dangvantuan/vietnamese-embedding",
     weight_dense: float  = 0.6,
     weight_sparse: float = 0.4,
-    bm25_top_k_articles: int = 200,
+    bm25_top_k_articles: int = 500,
     bm25_top_k_laws: int = 5,
     bm25_strategy: str   = "hybrid",
     bgem3_top_k: int    = 100,
@@ -197,8 +197,19 @@ def run_pipeline(
     )
 
     # ── Tầng 3: Predictor ────────────────────────────────────────────
-    LOGGER.info("[Pipeline] ── Tầng 3: Predictor (mode=%s) ──", llm_mode)
-    predictor = LLMPredictor(mode=llm_mode, model_name=llm2_model)
+    _default_label = "PARTIAL_A_WIN"
+    _baseline_path = PROJECT_ROOT / "outputs" / "baseline_check.json"
+    if _baseline_path.exists():
+        try:
+            _baseline_data = json.loads(_baseline_path.read_text(encoding="utf-8"))
+            _default_label = _baseline_data.get("majority_label", "PARTIAL_A_WIN")
+            LOGGER.info("[Pipeline] Loaded majority_label from baseline: %s", _default_label)
+        except Exception as exc:
+            LOGGER.warning("[Pipeline] Could not read baseline_check.json: %s", exc)
+
+    LOGGER.info("[Pipeline] ── Tầng 3: Predictor (mode=%s, default_label=%s) ──",
+                llm_mode, _default_label)
+    predictor = LLMPredictor(mode=llm_mode, model_name=llm2_model, default_label=_default_label)
 
     # ── Case Content API ─────────────────────────────────────────────
     case_client: CaseAPIClient | None = None
@@ -257,7 +268,8 @@ def run_pipeline(
                 for a in final_articles
             ],
         })
-
+        
+    predictor.report_parse_stats()
     # ── Save ─────────────────────────────────────────────────────────
     out_dir = resolve_path(output_dir, PROJECT_ROOT)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -289,7 +301,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--vn-model",    default=rc.get("vn_model",     "dangvantuan/vietnamese-embedding"))
 
     # ── Tầng 1 params ────────────────────────────────────────────────
-    p.add_argument("--bm25-top-k-articles", type=int,   default=int(rc.get("bm25_top_k_articles", 200)))
+    p.add_argument("--bm25-top-k-articles", type=int,   default=int(rc.get("bm25_top_k_articles", 500)))
     p.add_argument("--bm25-top-k-laws",     type=int,   default=int(rc.get("bm25_top_k_laws",     5)))
     p.add_argument("--bm25-strategy",       default=rc.get("bm25_strategy", "hybrid"),
                    choices=["article", "law", "hybrid"])

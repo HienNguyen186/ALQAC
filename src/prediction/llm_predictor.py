@@ -1,4 +1,7 @@
-"""Outcome prediction with Qwen or deterministic mock mode."""
+"""Outcome prediction with Qwen or deterministic mock mode.
+
+Giai đoạn 1: Sửa fallback khỏi hard-code, thêm parse stats tracking.
+"""
 
 from __future__ import annotations
 
@@ -23,10 +26,6 @@ LOGGER = logging.getLogger(__name__)
 VALID_LABELS = ["A_WIN", "PARTIAL_A_WIN", "B_WIN", "PARTIAL_B_WIN"]
 _LABEL_SET   = set(VALID_LABELS)
 
-# ── System prompt được viết lại để:
-# 1. Tắt Qwen3 thinking mode (/no_think)
-# 2. Mô tả rõ B_WIN và PARTIAL_B_WIN với ví dụ cụ thể
-# 3. Dùng Few-shot để model thấy tất cả 4 nhãn
 SYSTEM_PROMPT = """/no_think
 Bạn là hệ thống dự đoán kết quả tòa án dân sự Việt Nam.
 
@@ -93,8 +92,16 @@ def _strip_think_tags(text: str) -> str:
     return text.strip()
 
 
-def parse_prediction(text: str) -> tuple[str, float, str]:
-    """Parse label, confidence, reasoning từ output model."""
+def parse_prediction(
+    text: str,
+    default_label: str = "PARTIAL_A_WIN",
+) -> tuple[str, float, str, str]:
+    """Parse label, confidence, reasoning từ output model.
+
+    Returns:
+        (label, confidence, reasoning, parse_status)
+        parse_status: "json" | "regex" | "hard_fallback"
+    """
     raw = _strip_think_tags(text)
 
     # Thử parse JSON
@@ -107,7 +114,7 @@ def parse_prediction(text: str) -> tuple[str, float, str]:
             confidence = float(payload.get("confidence", 0.5))
             reasoning  = str(payload.get("reasoning", ""))
             if label in _LABEL_SET:
-                return label, max(0.0, min(1.0, confidence)), reasoning
+                return label, max(0.0, min(1.0, confidence)), reasoning, "json"
     except Exception:
         pass
 
@@ -116,18 +123,20 @@ def parse_prediction(text: str) -> tuple[str, float, str]:
     for label in VALID_LABELS:
         if re.search(rf"\b{label}\b", upper):
             LOGGER.warning("[LLMPredictor] JSON parse failed, regex fallback: %s", label)
-            return label, 0.5, raw[:200]
+            return label, 0.5, raw[:200], "regex"
 
+    # Hard fallback — dùng default_label (đo được từ baseline)
     LOGGER.error("[LLMPredictor] Could not parse output: %r", raw[:300])
-    return "PARTIAL_A_WIN", 0.34, raw[:200] or "Fallback."
+    return default_label, 0.34, raw[:200] or "Fallback.", "hard_fallback"
 
 
 @dataclass(frozen=True)
 class PredictResult:
-    label:      str
-    reasoning:  str
-    raw_output: str
-    confidence: float
+    label:        str
+    reasoning:    str
+    raw_output:   str
+    confidence:   float
+    parse_status: str = "mock"   # "json" | "regex" | "hard_fallback" | "mock"
 
 
 class LLMPredictor:
@@ -138,9 +147,11 @@ class LLMPredictor:
         mode: str = "local",
         model_name: str = "Qwen/Qwen3-8B",
         cache_dir: str | Path | None = None,
+        default_label: str = "PARTIAL_A_WIN",
     ):
-        self.mode       = mode
-        self.model_name = model_name
+        self.mode          = mode
+        self.model_name    = model_name
+        self.default_label = default_label
 
         if cache_dir:
             self.cache_dir = Path(cache_dir)
@@ -153,6 +164,9 @@ class LLMPredictor:
 
         self._model     = None
         self._tokenizer = None
+        # Track parse stats
+        self._parse_stats: dict[str, int] = {"json": 0, "regex": 0, "hard_fallback": 0}
+
         if mode == "local":
             self._load_model()
 
@@ -207,8 +221,12 @@ class LLMPredictor:
             confidence = 0.42
         evidence_ids = [f"{a.get('law_id')}:{a.get('aid')}" for a in law_articles]
         raw = json.dumps({"label": label, "confidence": confidence, "reasoning": "mock"})
-        return PredictResult(label=label, confidence=confidence,
-                             reasoning=f"[MOCK] evidence={evidence_ids}", raw_output=raw)
+        return PredictResult(
+            label=label, confidence=confidence,
+            reasoning=f"[MOCK] evidence={evidence_ids}",
+            raw_output=raw,
+            parse_status="mock",
+        )
 
     def _local_predict(self, case_query: str, law_articles: list[dict[str, Any]]) -> PredictResult:
         assert self._model is not None and self._tokenizer is not None
@@ -224,7 +242,7 @@ class LLMPredictor:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=False,   # Tắt thinking mode Qwen3
+                enable_thinking=False,
             )
         except TypeError:
             text = self._tokenizer.apply_chat_template(
@@ -249,5 +267,31 @@ class LLMPredictor:
         raw     = self._tokenizer.decode(new_ids, skip_special_tokens=True)
 
         LOGGER.debug("[LLMPredictor] raw: %r", raw[:200])
-        label, confidence, reasoning = parse_prediction(raw)
-        return PredictResult(label=label, confidence=confidence, reasoning=reasoning, raw_output=raw)
+        label, confidence, reasoning, status = parse_prediction(raw, default_label=self.default_label)
+        self._parse_stats[status] = self._parse_stats.get(status, 0) + 1
+
+        return PredictResult(
+            label=label, confidence=confidence, reasoning=reasoning,
+            raw_output=raw, parse_status=status,
+        )
+
+    def report_parse_stats(self) -> None:
+        """Gọi cuối pipeline để xem % case rơi vào fallback."""
+        total = sum(self._parse_stats.values())
+        if not total:
+            return
+        LOGGER.info("[LLMPredictor] Parse stats over %d cases:", total)
+        for status, cnt in sorted(self._parse_stats.items()):
+            pct = cnt / total * 100 if total else 0
+            LOGGER.info("  %-14s %5d (%.1f%%)", status, cnt, pct)
+
+        fallback_pct = self._parse_stats.get("hard_fallback", 0) / total * 100 if total else 0
+        if fallback_pct > 10:
+            LOGGER.warning(
+                "[LLMPredictor] hard_fallback rate = %.1f%% (>10%%). "
+                "Prompt hoặc output format của model đang có vấn đề — "
+                "kiểm tra raw_output mẫu trước khi tối ưu tiếp Giai đoạn 2/3.",
+                fallback_pct,
+            )
+        elif total > 0:
+            LOGGER.info("[LLMPredictor] Parse success rate = %.1f%%", (total - fallback_pct) / total * 100)

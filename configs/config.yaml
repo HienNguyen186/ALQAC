@@ -7,7 +7,7 @@ data:
 
 retrieval:
   # ── BM25 first-stage ─────────────────────────────────────────────
-  bm25_top_k_articles: 200
+  bm25_top_k_articles: 500
   bm25_top_k_laws:     5
   bm25_strategy:       "hybrid"
 
