@@ -1,4 +1,13 @@
-"""Rule-based query expansion for Vietnamese civil-law retrieval."""
+"""Rule-based query expansion for Vietnamese civil-law retrieval.
+
+Nâng cấp: thêm rule PHỔ QUÁT cho các luật thủ tục/tố tụng gần như luôn xuất
+hiện trong ground-truth của MỌI vụ án dân sự (thẩm quyền, án phí, thi hành án)
+nhưng bị BM25 bỏ sót vì case_query hiếm khi nhắc trực tiếp các từ này.
+
+Debug data cho thấy:
+  92/2015/QH13 (Bộ luật Tố tụng Dân sự): 14 provisions trong GT, chỉ retrieve 7%
+  26/2008/QH12 (Luật Thi hành án Dân sự): 5 provisions trong GT, retrieve 0%
+"""
 
 from __future__ import annotations
 
@@ -37,6 +46,21 @@ EXPANSION_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (
         ("lai cham tra", "cham thanh toan", "cham tra"),
         "nghia vu cham tra lai cham tra dieu 357 dieu 468 bo luat dan su",
+    ),
+    # ------------------------------------------------------------------
+    # ✅ MỚI: Rule phổ quát — kích hoạt cho HẦU HẾT mọi vụ án dân sự.
+    # Trigger bằng các từ khóa gần như luôn xuất hiện trong case_query
+    # ("kiện", "khởi kiện", "tranh chấp", "yêu cầu") để bù đắp việc
+    # BM25 hiếm khi match trực tiếp "tố tụng" hay "thi hành án".
+    # ------------------------------------------------------------------
+    (
+        ("khoi kien", "tranh chap", "yeu cau toa an", "nguyen don", "bi don"),
+        "tham quyen giai quyet thu tuc to tung dan su khoi kien nghia vu chung minh "
+        "bo luat to tung dan su nghia vu thi hanh an dan su",
+    ),
+    (
+        ("thi hanh an", "cuong che", "ke bien tai san"),
+        "thi hanh an dan su cuong che ke bien tai san luat thi hanh an dan su",
     ),
 )
 

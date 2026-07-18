@@ -1,5 +1,7 @@
-# ALQAC 2026 — Pipeline Configuration
-# Kiến trúc: Multi-Retrieval (BM25 + BGE-M3 + VN Embedding + Chunked) + LLM Reranker
+# ALQAC 2026 — Pipeline Configuration (v3)
+# Kiến trúc: Multi-Retrieval (BM25 + BGE-M3 + VN Embedding + Chunked)
+#            + Ensemble Reranker (CrossEncoder + VN Embedding)
+#            + Qwen3-8B direct-label predictor
 
 data:
   law_corpus:  "data/raw/corpus_law_pub.json"
@@ -7,7 +9,7 @@ data:
 
 retrieval:
   # ── BM25 first-stage ─────────────────────────────────────────────
-  bm25_top_k_articles: 500
+  bm25_top_k_articles: 500    # ✅ Tăng từ 200 (Recall@20=10% → cần pool to hơn)
   bm25_top_k_laws:     5
   bm25_strategy:       "hybrid"
 
@@ -17,7 +19,7 @@ retrieval:
   weight_dense:  0.6
   weight_sparse: 0.4
 
-  # ── Vietnamese Embedding (PhoBERT) ───────────────────────────────
+  # ── Vietnamese Embedding (PhoBERT) — dùng cả retrieval lẫn reranking ─
   vn_model:  "dangvantuan/vietnamese-embedding"
   vn_top_k:  100
 
@@ -25,18 +27,16 @@ retrieval:
   chunked_top_k: 100
 
   # ── RRF Fusion output ────────────────────────────────────────────
-  fusion_top_k: 500    # Tổng candidates sau union (input LLM reranker)
+  fusion_top_k: 1000   # ✅ Tăng từ 500 (bù Recall thấp trước reranking)
 
   # ── Misc ─────────────────────────────────────────────────────────
   batch_size: 32
 
-  # ── LLM Reranker ─────────────────────────────────────────────────
-  # GT median = 7 articles, mean = 8.3
+  # ── Ensemble Reranker (v2: CrossEncoder + VN Embedding) ──────────
   final_min_k: 3
   final_max_k: 15
 
 prediction:
-  reranker_model:  "Qwen/Qwen2.5-3B-Instruct"
   predictor_model: "Qwen/Qwen3-8B"
 
 output:
