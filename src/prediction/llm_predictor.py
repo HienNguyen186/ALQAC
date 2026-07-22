@@ -240,26 +240,50 @@ class LLMPredictor:
         LOGGER.info("[LLMPredictor] Loading %s (extract_rule=%s) ...",
                     self.model_name, self.use_extract_rule)
 
+        # Load tokenizer FIRST (on CPU)
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=True,
             cache_dir=cache,
+            padding_side="left",  # ✅ Set padding side
         )
+        # Set pad token if not set
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+        
+        LOGGER.info("[LLMPredictor] Tokenizer loaded (pad_token=%s)", 
+                    repr(self._tokenizer.pad_token))
+
+        # Load model with BitsAndBytes
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            quantization_config=quant_config,
-            device_map="auto",
-            trust_remote_code=True,
-            cache_dir=cache,
-        )
+        
+        try:
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                quantization_config=quant_config,
+                device_map="auto",
+                trust_remote_code=True,
+                cache_dir=cache,
+                attn_implementation="flash_attention_2",  # ✅ Use flash attention for stability
+            )
+        except Exception as e:
+            LOGGER.warning("[LLMPredictor] Flash attention failed (%s), retrying without it", e)
+            # Fallback without flash attention
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                quantization_config=quant_config,
+                device_map="auto",
+                trust_remote_code=True,
+                cache_dir=cache,
+            )
+        
         self._model.eval()
-        LOGGER.info("[LLMPredictor] Ready")
+        LOGGER.info("[LLMPredictor] Model loaded and ready")
 
     def predict(self, case_query: str, law_articles: list[dict[str, Any]]) -> PredictResult:
         if self.mode == "mock":

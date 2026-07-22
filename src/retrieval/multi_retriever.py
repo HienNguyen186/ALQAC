@@ -83,9 +83,9 @@ class MultiRetriever:
 
         # ── BM25 ──────────────────────────────────────────────────────
         LOGGER.info("[MultiRetriever] [1/2] BM25 Retriever ...")
+        # strategy is a param of retrieve_candidate_pool(), not __init__()
         self.bm25 = LawRetriever(
             corpus_path=Path(corpus_path) if corpus_path else None,
-            strategy=bm25_strategy,
         )
 
         # ── Vietnamese Embedding ──────────────────────────────────────
@@ -121,16 +121,26 @@ class MultiRetriever:
             return self._mock_retrieve(query, top_k)
 
         # ── BM25 ──────────────────────────────────────────────────────
-        LOGGER.info("[MultiRetriever] BM25 (%d) ...", self.bm25_top_k_articles)
-        bm25_results = self.bm25.retrieve(query, top_k=self.bm25_top_k_articles)
+        LOGGER.info("[MultiRetriever] BM25 (%d, strategy=%s) ...",
+                    self.bm25_top_k_articles, self.bm25_strategy)
+        bm25_results = self.bm25.retrieve_candidate_pool(
+            query,
+            top_k_articles=self.bm25_top_k_articles,
+            top_k_laws=self.bm25_top_k_laws,
+            strategy=self.bm25_strategy,
+        )
         bm25_ranking: dict[tuple, float] = {
-            (str(a.get("law_id")), a.get("aid")): float(a.get("retrieval_score", 0.0))
+            (str(a.get("law_id")), a.get("aid")): float(a.get("bm25_score", 0.0))
             for a in bm25_results
         }
 
         # ── Vietnamese Embedding ──────────────────────────────────────
-        LOGGER.info("[MultiRetriever] Vietnamese Embedding (%d) ...", self.vn_top_k)
-        vn_results = self.vn.retrieve(query, top_k=self.vn_top_k)
+        LOGGER.info("[MultiRetriever] Vietnamese Embedding rerank (%d→%d) ...", len(bm25_results), self.vn_top_k)
+        vn_results = self.vn.retrieve(
+            query,
+            articles=bm25_results,  # Rerank BM25 candidates
+            top_k=self.vn_top_k,
+        )
         vn_ranking: dict[tuple, float] = {
             (str(a.get("law_id")), a.get("aid")): float(a.get("vn_score", a.get("retrieval_score", 0.0)))
             for a in vn_results
