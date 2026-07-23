@@ -56,14 +56,14 @@ class VietnameseRetriever:
         self,
         mode: str = "local",
         model_name: str = DEFAULT_MODEL,
-        batch_size: int = 16,  # Giảm từ 64 → 16 để tránh scatter gather OOM
+        batch_size: int = 2,  # Giảm từ 64 → 16 để tránh scatter gather OOM
         cache_dir: str | Path | None = None,
         model_cache_dir: str | Path | None = None,
         device: str | None = None,
     ):
         self.mode       = mode
         self.model_name = model_name
-        self.batch_size = 16  # ← Giảm từ 64 → 16 (GPU optimization)
+        self.batch_size = 2  # ← Giảm từ 64 → 16 (GPU optimization)
         self.cache_dir  = (
             Path(cache_dir) if cache_dir
             else find_project_root() / "outputs" / "cache" / "vn_embeddings"
