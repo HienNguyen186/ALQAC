@@ -53,7 +53,7 @@ if _cache_dir.exists():
 
 from tqdm import tqdm
 
-from src.case_api import CaseAPIClient
+from src.api.case_api import CaseAPIClient
 from src.prediction.llm_predictor import LLMPredictor
 from src.retrieval.multi_retriever import MultiRetriever
 from src.reranking.ensemble_reranker import EnsembleReranker
@@ -71,10 +71,7 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_CASE_API_CALLS = 3
 
 
-def _build_case_queries(
-    case_query: str,
-    final_articles: list[dict[str, Any]],
-) -> list[str]:
+def _build_case_queries(case_query: str, final_articles: list[dict[str, Any]]) -> list[str]:
     queries = [case_query]
     if final_articles:
         art = final_articles[0]
@@ -83,8 +80,8 @@ def _build_case_queries(
     if short not in queries:
         queries.append(short)
     return queries
-
-
+ 
+ 
 def _fetch_case_evidence(
     client: CaseAPIClient,
     case_id: str,
@@ -92,20 +89,22 @@ def _fetch_case_evidence(
     final_articles: list[dict[str, Any]],
     n_calls: int = DEFAULT_CASE_API_CALLS,
 ) -> list[str]:
-    queries  = _build_case_queries(case_query, final_articles)[:n_calls]
+    queries   = _build_case_queries(case_query, final_articles)[:n_calls]
     hash_ids: list[str] = []
     seen:     set[str]  = set()
+ 
     for query in queries:
         try:
-            resp    = client.search_case_segments(case_id=case_id, query=query)
+            resp = client.search_case_segments(case_id=case_id, query=query)
             result  = resp.get("result", {})
             hash_id = result.get("hash_id", "")
             if hash_id and hash_id not in seen:
                 seen.add(hash_id)
                 hash_ids.append(hash_id)
-                LOGGER.debug("[CaseAPI] %s → %s", case_id, hash_id)
+                LOGGER.debug("[CaseAPI] %s query=%r → %s", case_id, query[:40], hash_id)
         except Exception as exc:
-            LOGGER.warning("[CaseAPI] %s failed: %s", case_id, exc)
+            LOGGER.warning("[CaseAPI] %s failed (query=%r): %s", case_id, query[:40], exc)
+ 
     return hash_ids
 
 
@@ -324,8 +323,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size",  type=int,  default=int(rc.get("batch_size", 32)))
     p.add_argument("--no-parallel", action="store_true")
     p.add_argument("--limit",       type=int,  default=None)
-    p.add_argument("--test",   default=cfg.get("data",   {}).get("public_test",      "data/raw/ALQAC2026_public_test.json"))
-    p.add_argument("--corpus", default=cfg.get("data",   {}).get("law_corpus",       "data/raw/corpus_law_pub.json"))
+    p.add_argument("--test",   default=cfg.get("data",   {}).get("private_test",      "data/raw/ALQAC_private_test.json"))
+    p.add_argument("--corpus", default=cfg.get("data",   {}).get("law_corpus",       "data/private_test_60_cases_extracted_corpus.json"))
     p.add_argument("--output", default=cfg.get("output", {}).get("submissions_dir",  "outputs/submissions"))
     p.add_argument("--log-level", default="INFO")
     return p

@@ -56,14 +56,14 @@ class VietnameseRetriever:
         self,
         mode: str = "local",
         model_name: str = DEFAULT_MODEL,
-        batch_size: int = 2,  # Giảm từ 64 → 16 để tránh scatter gather OOM
+        batch_size: int = 16,  # Giảm từ 64 → 16 để tránh scatter gather OOM
         cache_dir: str | Path | None = None,
         model_cache_dir: str | Path | None = None,
         device: str | None = None,
     ):
         self.mode       = mode
         self.model_name = model_name
-        self.batch_size = 2  # ← Giảm từ 64 → 16 (GPU optimization)
+        self.batch_size = 16  # ← Giảm từ 64 → 16 (GPU optimization)
         self.cache_dir  = (
             Path(cache_dir) if cache_dir
             else find_project_root() / "outputs" / "cache" / "vn_embeddings"
@@ -110,6 +110,19 @@ class VietnameseRetriever:
             cache_folder=cache,
             trust_remote_code=True,
         )
+
+        self._model.max_seq_length = 256
+        
+        LOGGER.info(
+            "Tokenizer vocab size: %d",
+            self._model.tokenizer.vocab_size,
+        )
+        
+        LOGGER.info(
+            "Model vocab size: %d",
+            self._model[0].auto_model.config.vocab_size,
+        )
+
         LOGGER.info("[VietnameseRetriever] Ready (dim=%d)", self._model.get_sentence_embedding_dimension())
 
     # ------------------------------------------------------------------
@@ -158,23 +171,40 @@ class VietnameseRetriever:
 
         assert self._model is not None
         # ← Truncate to 256 tokens to reduce VRAM (from full content)
-        texts = [" ".join(str(a.get("content", "")).split()[:256]) for a in articles]
+        texts = []
+
+        for idx, article in enumerate(articles):
+            text = article.get("content")
+        
+            if text is None:
+                LOGGER.warning("Article %d has None content", idx)
+                text = ""
+        
+            elif not isinstance(text, str):
+                LOGGER.warning(
+                    "Article %d has invalid type: %s",
+                    idx,
+                    type(text),
+                )
+                text = str(text)
+        
+            texts.append(text)
+            
         LOGGER.info("[VietnameseRetriever] Encoding %d articles ...", len(texts))
         
         try:
             embs = self._model.encode(
                 texts,
-                batch_size=max(4, self.batch_size // 16),  # Giảm batch size
+                batch_size=self.batch_size,
                 normalize_embeddings=True,
                 show_progress_bar=False,
             )
-        except RuntimeError as e:
-            LOGGER.warning("[VietnameseRetriever] Encode failed: %s, returning zeros", e)
-            # Fallback: return zero embeddings thay vì crash
-            dim = self._model.get_sentence_embedding_dimension()
-            embs = np.zeros((len(texts), dim), dtype=np.float32)
+        except Exception:
+            LOGGER.exception("[VietnameseRetriever] Encode failed")
+            raise
         
         result = np.asarray(embs, dtype=np.float32)
+        
         self._save_cache(cache_path, result)
         LOGGER.info("[VietnameseRetriever] Encoded and cached.")
         return result
